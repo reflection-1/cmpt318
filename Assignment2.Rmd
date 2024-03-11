@@ -1,0 +1,257 @@
+## Assignment 1
+
+## Household Electricity Consumption Analysis
+
+### Team Members
+
+#### Anshal Chopra: 301384760
+
+#### Sahaj Karan: 301386551
+
+#### Arshnoor Singh: 301401444
+
+#### Sakshi Singh: 301386720
+
+##### Loading required packages
+
+```{r}
+##### Loading required packages #####
+library(readr)
+library(dplyr)
+library(ggplot2)
+library(corrplot)
+library(lubridate)
+library(zoo)
+library(xts)
+library(hms)
+```
+
+##### Loading preprocessed dataset from Assignment 1
+
+```{r}
+##### Reading the dataset #####
+col_types <- cols(
+  default = col_double(),
+  column1 = col_date(format = "%d/%m/%Y"),
+  column2 = col_time(format = "%H:%M:%S")
+)
+consumption_data <- read_csv("Group_Assignment_Dataset.txt", col_types = col_types )
+
+# converting the dataset to time series object for interpolation
+
+# combining date and time columns into a single datetime column
+consumption_data$Datetime <- as.POSIXct(paste(consumption_data$Date, consumption_data$Time), 
+                                        format = "%d/%m/%Y %H:%M:%S")
+# checking for NA values in datetime and fixing the issue in the Date or Time columns 
+data <- consumption_data[is.na(consumption_data$Datetime),]
+consumption_data <- consumption_data[!is.na(consumption_data$Datetime),]
+fix_dates <- function(x)
+{
+  dates <- format(as.Date(x, format = "%m/%d/%Y"), "%d/%m/%Y")
+  return(dates)
+}
+data$Date <- lapply(data$Date, fix_dates)
+data$Datetime <- as.POSIXct(paste(data$Date, data$Time), 
+                            format = "%d/%m/%Y %H:%M:%S")
+#ensuring that the data is ordered
+consumption_data <- rbind(consumption_data, data)
+consumption_data <- consumption_data[order(consumption_data$Datetime),]
+
+#converting to multivariate time series object
+mts_consumption_data <- xts(consumption_data[-which(names(consumption_data) %in% c("Date", "Time", "Datetime"))],
+                            order.by = consumption_data$Datetime)
+
+#interpolating the dataset
+mts_consumption_data <- na.approx(mts_consumption_data)
+
+#calculating the z score for each data point for each feature
+z_scores <- scale(mts_consumption_data)
+
+```
+
+#### Assignment 2 Starts Here
+
+##### Q2
+
+###### removing all the anomalies we found in our dataset in Assignment 1
+
+```{r}
+indices <- which(apply(z_scores, 1, function(row_z) any(row_z > 3)))
+
+# Remove rows with z-score > 3 in any column
+consumption_preprocessed <- mts_consumption_data[-indices, ]
+```
+
+###### Slicing the datasets into different weeks
+
+```{r}
+
+# Convert xts or zoo object to a data frame and add a timestamp column
+consumption_preprocessed <- data.frame(timestamp = index(consumption_preprocessed), coredata(consumption_preprocessed))
+
+# Convert integer timestamp to POSIXct
+consumption_preprocessed$timestamp <- as.POSIXct(consumption_preprocessed$timestamp, origin="1970-01-01")
+
+# Add a unique identifier for each week (Monday-Sunday)
+consumption_preprocessed <- consumption_preprocessed %>%
+  mutate(adjusted_timestamp = timestamp - days(wday(timestamp) == 1),
+         week_identifier = week(adjusted_timestamp))
+# Print the data frame
+print(consumption_preprocessed)
+```
+
+###### Calculate moving average for each given week
+
+```{r}
+# Calculate rolling average
+consumption_preprocessed <- consumption_preprocessed %>%
+  arrange(week_identifier, timestamp) %>%
+  group_by(week_identifier) %>%
+  mutate(Global_intensity = ifelse(row_number() > 6, rollmean(Global_intensity, k = 7, fill = Global_intensity), Global_intensity))
+
+# Print the data frame
+print(consumption_preprocessed)
+```
+
+###### calculating the time difference of each row within a week from the first row of the week
+
+```{r}
+consumption_preprocessed <- consumption_preprocessed %>%
+  group_by(week_identifier) %>%
+  mutate(date_of_first_timestamp = as.Date(first(timestamp)),
+         time_diff = as.numeric(difftime(timestamp, paste(date_of_first_timestamp, "00:00:00"), units = "mins")))
+# Print the data frame
+print(consumption_preprocessed)
+```
+
+###### calculating weekly average and standard deviation for each data minute
+
+```{r}
+weekly_average <- select(ungroup(consumption_preprocessed),c("time_diff", "Global_intensity"))
+
+weekly_average <- weekly_average %>%
+  group_by(time_diff) %>%
+  summarise(
+    Global_intensity_M = mean(Global_intensity, na.rm = TRUE)
+  )
+print(weekly_average)
+```
+
+###### combining the averages to the actual data we had
+
+```{r}
+consumption_preprocessed <- consumption_preprocessed %>%
+  left_join(weekly_average, by = "time_diff")
+```
+
+###### calculating z_scores using the mean and standard deviation we previously calculated
+
+```{r}
+consumption_preprocessed$diff_mean <- abs(consumption_preprocessed$Global_intensity - consumption_preprocessed$Global_intensity_M)
+```
+
+###### Averaging the difference of smoothened week from smoothened average week grouped by each week
+
+```{r}
+# We selected the mean absolute difference between the values of the smoothed week and the smoothed average week as our metric. This choice allows us to quantify, on average, the deviation of data points from the weekly average. In the context of anomalies, this metric is particularly useful. It provides a measure of how “abnormal” each week is compared to a typical (average) week. A larger value would suggest a higher degree of anomaly in the data for that week, indicating a significant departure from the norm. Conversely, a smaller value suggests that the week’s data points are close to the average, indicating a more “normal” week. This approach allows us to detect and quantify anomalies in a time series effectively
+consumption_anomaly_scores = consumption_preprocessed %>% group_by(week_identifier) %>% summarise(anomaly_scores = mean(diff_mean))
+print(consumption_anomaly_scores)
+```
+
+###### Calculating the week with most and least scoring
+
+```{r}
+print(consumption_anomaly_scores[consumption_anomaly_scores$anomaly_scores == max(consumption_anomaly_scores$anomaly_scores),])
+# most anomalous is week 1
+
+print(consumption_anomaly_scores[consumption_anomaly_scores$anomaly_scores == min(consumption_anomaly_scores$anomaly_scores),])
+# least anomalous is week 25
+```
+
+###### Plotting the average smoothened week with the most and least anomalous weeks
+
+```{r}
+
+df <- select(ungroup(consumption_preprocessed), c(time_diff, Global_intensity_M))
+
+df <- df %>% distinct()
+
+df1 <- select(ungroup(consumption_preprocessed[consumption_preprocessed$week_identifier == 1,]), c(time_diff, Global_intensity))
+
+df25 <- select(ungroup(consumption_preprocessed[consumption_preprocessed$week_identifier == 25,]), c(time_diff, Global_intensity))
+
+# Merge df and df1 on 'time_diff', and add suffixes to distinguish the 'Global_intensity' columns
+df <- df %>%
+  left_join(df1, by = "time_diff")
+# Merge the resulting dataframe with df25
+df <- df %>%
+  left_join(df25, by = "time_diff")
+
+# Rename the 'Global_intensity' column in the merged dataframe to indicate it's from 'Week 25'
+names(df)[names(df) == "Global_intensity.x"] <- "Global_intensity_week1"
+names(df)[names(df) == "Global_intensity.y"] <- "Global_intensity_week25"
+
+# Now, you can plot the data
+ggplot(df, aes(x = time_diff)) +
+  geom_line(aes(y = Global_intensity_M, color = "Smoothened Average"), alpha = 1) +
+  geom_line(aes(y = Global_intensity_week1, color = "Week 1"), alpha = 1) +
+  geom_line(aes(y = Global_intensity_week25, color = "Week 25"), alpha = 1) +
+  scale_color_manual(values = c("Smoothened Average" = "red", "Week 1" = "orange", "Week 25" = "darkgreen")) +
+  labs(x = "Minutes since Start of the Week", y = "Global Intensity", title = "Time Series Plot", color = "Legend") +
+  theme_minimal() +
+  theme(legend.title = element_blank(), legend.position = "bottom")
+
+
+```
+
+```{r}
+ggplot(df, aes(x = time_diff)) +
+  geom_smooth(aes(y = Global_intensity_M, color = "Smoothened Average"), se = FALSE, linetype = "solid", size = 0.75) +
+  geom_smooth(aes(y = Global_intensity_week1, color = "Week 1"), se = FALSE, linetype = "solid", size = 0.75) +
+  geom_smooth(aes(y = Global_intensity_week25, color = "Week 25"), se = FALSE, linetype = "solid", size = 0.75) +
+  scale_color_manual(values = c("Smoothened Average" = "red", "Week 1" = "orange", "Week 25" = "darkgreen")) +
+  labs(x = "Minutes", y = "Global Intensity", title = "Time Series Plot", color = "Legend") +
+  theme_minimal() +
+  theme(legend.title = element_blank(), legend.position = "right")
+```
+```{r}
+
+#A3
+
+#qestion1
+
+library(depmixS4)  
+
+start_time <- as.POSIXct("2007-01-01 00:00:00")
+end_time <- as.POSIXct("2007-12-31 23:59:59")
+
+# Filter the dataset to include data within the time window
+time_window_data <- consumption_data %>% filter(Datetime >= start_time & Datetime <= end_time)
+
+# Initialize empty vectors to store results
+log_likelihood <- numeric(13)  # Assuming 4 to 16 states, so 13 possible states
+bic <- numeric(13)
+
+# Loop through different numbers of states
+for (n_states in 4:16) {
+    # Specify the HMM model
+  model <- depmix(Global_active_power ~ 1, data = time_window_data, nstates = n_states, ntimes = nrow(time_window_data))
+  
+  # Fit the model
+  fitModel <- fit(model)
+  
+  # Get summary
+  summary_info <- summary(fitModel)
+  
+log_likelihood[n_states - 3] <- summary_info[["St1", "Re1.(Intercept)"]]
+bic[n_states - 3] <- summary_info[["St1", "Re1.sd"]]
+
+
+}
+```
+```{r}
+
+# Plot log-likelihood and BIC
+plot(4:16, log_likelihood, type = "l", xlab = "Number of States", ylab = "Log-Likelihood", main = "Log-Likelihood vs. Number of States")
+plot(4:16, bic, type = "l", xlab = "Number of States", ylab = "BIC", main = "BIC vs. Number of States")
+```
